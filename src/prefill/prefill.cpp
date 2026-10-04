@@ -163,6 +163,7 @@ constexpr int DQ = 2;              // dequantized-expert ring (FP16 gate/up + do
 inline int bf16x2_mode() {
     static const int v = [] {
         const char* e = std::getenv("STRATA_PREFILL_BF16X2");
+        if (prompt_f16()) return 0;   // FP16 activations carry 11 mantissa bits; the BF16 low part does not apply
         return e != nullptr ? std::atoi(e) : 0;
     }();
     return v;
@@ -767,6 +768,7 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
         void* ws = o.take<uint8_t>(GEMM_WS, ok);
         if (!ok) { err = "prefill: GEMM scratch does not fit"; return false; }
         if (!m.gemm.init_external(stream, gs, GEMM_SCRATCH, ws, GEMM_WS, err)) return false;
+        set_act_f16(prompt_f16());   // this device's gr_* kernels write the image the GEMMs read
     }
     if (!carve(T, &o)) {
         err = "prefill: device buffers for a chunk of " + std::to_string(chunk) + " tokens do not fit";

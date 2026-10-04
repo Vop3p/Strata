@@ -44,6 +44,11 @@ bool hh_enabled() {
     static const bool on = [] { const char* e = std::getenv("STRATA_HIP_HHGEMM"); return !(e && e[0] == '0'); }();
     return on;
 }
+// elements per FP16 product / conversion slice (STRATA_HIP_HH_MELEMS, default 16 = 16 Mi elements, 32 MiB)
+int64_t hh_cap() {
+    static const int64_t c = [] { const char* e = std::getenv("STRATA_HIP_HH_MELEMS"); return (int64_t) (e ? std::atoi(e) : 16) << 20; }();
+    return c;
+}
 // Y[r, c] (row stride ldy) = float(t[r, c]) (+ beta * Y)
 __global__ void hh_f16_to_f32(const __half* t, float* y, int64_t n, int64_t ldy, float beta) {
     const int64_t r = blockIdx.y;
@@ -419,7 +424,7 @@ void Gemm::bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64
     if (hh_enabled() && hh_grow(hh_w_, hh_w_cap_, N * K)) {
         const cudaStream_t s = (cudaStream_t) stream_;
         hh_bf16_to_f16<<<1024, 256, 0, s>>>(W, (__half*) hh_w_, N * K);
-        const int64_t ts = std::max<int64_t>(1, std::min<int64_t>(T, ((int64_t) 16 << 20) / K));
+        const int64_t ts = std::max<int64_t>(1, std::min<int64_t>(T, hh_cap() / K));
         if (hh_grow(hh_x_, hh_x_cap_, ts * K)) {
             bool ok = true;
             for (int64_t t0 = 0; t0 < T && ok; t0 += ts) {
@@ -478,7 +483,7 @@ bool Gemm::hh(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t
               float beta) {
 #if defined(__HIPCC__)
     if (ldy <= 0) ldy = N;
-    const int64_t ts = std::max<int64_t>(1, std::min<int64_t>(T, ((int64_t) 16 << 20) / N));
+    const int64_t ts = std::max<int64_t>(1, std::min<int64_t>(T, hh_cap() / N));
     if (!hh_grow(hh_out_, hh_out_cap_, ts * N)) return false;
     const cudaStream_t s = (cudaStream_t) stream_;
     const float one = 1.0f, zero = 0.0f;

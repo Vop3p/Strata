@@ -1833,6 +1833,14 @@ int main(int argc, char** argv) {
     // link (the copy kernel, since 0.1.14), so on a slower link it must shrink or the window waits for it.  The
     // real H2D bandwidth is probed once; from 20 GB/s up (x16 PCIe 4/5) the measured default stays.  The canonical
     // pack's 0.2 was never measured against the link, so it is left alone.  `--calibrate` measures it outright.
+    // --remote-expert-opt: the primary leaves the helpers' experts out of its cache, so a PCIe share streams far more
+    // misses over the primary's link and the window waits for it (RX 6900 XT pair, IQ3_S, 5K prompts: 66-69 ms per
+    // window with the probed 0.39, 36-39 ms with 0).  The helper and the CPU take those misses instead.
+    if (o.pcie_frac < 0.0 && o.remote_expert_opt) {
+        o.pcie_frac = 0.0;
+        std::fprintf(stderr, "strata generate: --remote-expert-opt -> pcie_frac 0 (helpers take the misses; "
+                             "--pcie-frac overrides)\n");
+    }
     if (o.pcie_frac < 0.0) {
         const double base = native_pack ? 0.55 : 0.2;
         std::string bursts;

@@ -16,6 +16,7 @@
 #undef __ballot_sync
 #endif
 
+#include <algorithm>
 #include <climits>
 #include <cstdio>
 #include <cstdlib>
@@ -32,8 +33,35 @@
 #include <tuple>
 #endif
 
+#if defined(__HIPCC__)
+#include <hip/hip_fp16.h>
+#endif
+
 namespace strata::prefill {
 namespace {
+#if defined(__HIPCC__)
+bool hh_enabled() {
+    static const bool on = [] { const char* e = std::getenv("STRATA_HIP_HHGEMM"); return !(e && e[0] == '0'); }();
+    return on;
+}
+// Y[r, c] (row stride ldy) = float(t[r, c]) (+ beta * Y)
+__global__ void hh_f16_to_f32(const __half* t, float* y, int64_t n, int64_t ldy, float beta) {
+    const int64_t r = blockIdx.y;
+    for (int64_t c = blockIdx.x * (int64_t) blockDim.x + threadIdx.x; c < n; c += (int64_t) gridDim.x * blockDim.x) {
+        const float v = __half2float(t[r * n + c]);
+        float* p = y + r * ldy + c;
+        *p = beta == 0.0f ? v : v + beta * *p;
+    }
+}
+// BF16 bits -> FP16 bits, saturated to the FP16 range
+__global__ void hh_bf16_to_f16(const uint16_t* s, __half* d, int64_t n) {
+    for (int64_t i = blockIdx.x * (int64_t) blockDim.x + threadIdx.x; i < n; i += (int64_t) gridDim.x * blockDim.x) {
+        float f = __uint_as_float((uint32_t) s[i] << 16);
+        f = fminf(fmaxf(f, -65504.0f), 65504.0f);
+        d[i] = __float2half(f);
+    }
+}
+#endif
 
 void ck(cublasStatus_t s, const char* what) {
     if (s != CUBLAS_STATUS_SUCCESS) {
@@ -298,6 +326,9 @@ Gemm::~Gemm() {
     delete static_cast<HipLtState*>(hipblaslt_state_);
 #endif
     if (handle_) cublasDestroy((cublasHandle_t) handle_);
+    if (hh_out_) cudaFree(hh_out_);
+    if (hh_x_) cudaFree(hh_x_);
+    if (hh_w_) cudaFree(hh_w_);
     if (!external_) {
         if (scratch_) cudaFree(scratch_);
         if (workspace_) cudaFree(workspace_);
@@ -384,6 +415,22 @@ void Gemm::bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64
         return;
     }
 #endif
+#if defined(__HIPCC__)
+    if (hh_enabled() && hh_grow(hh_w_, hh_w_cap_, N * K)) {
+        const cudaStream_t s = (cudaStream_t) stream_;
+        hh_bf16_to_f16<<<1024, 256, 0, s>>>(W, (__half*) hh_w_, N * K);
+        const int64_t ts = std::max<int64_t>(1, std::min<int64_t>(T, ((int64_t) 16 << 20) / K));
+        if (hh_grow(hh_x_, hh_x_cap_, ts * K)) {
+            bool ok = true;
+            for (int64_t t0 = 0; t0 < T && ok; t0 += ts) {
+                const int64_t n = std::min(ts, T - t0);
+                hh_bf16_to_f16<<<1024, 256, 0, s>>>(X + t0 * K, (__half*) hh_x_, n * K);
+                ok = hh(hh_x_, hh_w_, Y + t0 * ldy, n, N, K, ldy, beta);
+            }
+            if (ok) return;
+        }
+    }
+#endif
     // Column-major view: Y^T[N, T] = W[N, K] (stored K x N col-major, transposed) . X^T[K, T].
     ck(cublasGemmEx((cublasHandle_t) handle_, CUBLAS_OP_T, CUBLAS_OP_N, (int) N, (int) T, (int) K, &alpha, W,
                     CUDA_R_16BF, (int) K, X, CUDA_R_16BF, (int) K, &beta, Y, CUDA_R_32F, (int) ldy,
@@ -404,11 +451,54 @@ void Gemm::f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_
         return;
     }
 #endif
+#if defined(__HIPCC__)
+    if (hh_enabled() && hh(X, W, Y, T, N, K, ldy, beta)) return;
+#endif
     ck(cublasGemmEx((cublasHandle_t) handle_, CUBLAS_OP_T, CUBLAS_OP_N, (int) N, (int) T, (int) K, &alpha, W,
                     CUDA_R_16F, (int) K, X, CUDA_R_16F, (int) K, &beta, Y, CUDA_R_32F, (int) ldy,
                     CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT),
        "cublasGemmEx f16");
     STRATA_ABSORB_HIPBLAS_STICKY("cublasGemmEx f16");
+}
+
+bool Gemm::hh_grow(uint16_t*& p, int64_t& cap, int64_t need) {
+    if (need <= cap) return true;
+    if (p) {   // the stream may still read the old buffer
+        cudaStreamSynchronize((cudaStream_t) stream_);
+        cudaFree(p);
+    }
+    p = nullptr;
+    cap = 0;
+    if (cudaMalloc((void**) &p, (size_t) need * 2) != cudaSuccess) { cudaGetLastError(); p = nullptr; return false; }
+    cap = need;
+    return true;
+}
+
+bool Gemm::hh(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,
+              float beta) {
+#if defined(__HIPCC__)
+    if (ldy <= 0) ldy = N;
+    const int64_t ts = std::max<int64_t>(1, std::min<int64_t>(T, ((int64_t) 16 << 20) / N));
+    if (!hh_grow(hh_out_, hh_out_cap_, ts * N)) return false;
+    const cudaStream_t s = (cudaStream_t) stream_;
+    const float one = 1.0f, zero = 0.0f;
+    for (int64_t t0 = 0; t0 < T; t0 += ts) {
+        const int64_t n = std::min(ts, T - t0);
+        if (cublasGemmEx((cublasHandle_t) handle_, CUBLAS_OP_T, CUBLAS_OP_N, (int) N, (int) n, (int) K, &one, W,
+                         CUDA_R_16F, (int) K, X + t0 * K, CUDA_R_16F, (int) K, &zero, hh_out_, CUDA_R_16F, (int) N,
+                         CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) != CUBLAS_STATUS_SUCCESS) {
+            std::fprintf(stderr, "prefill gemm: FP16-out GEMM failed (N=%lld T=%lld K=%lld)\n", (long long) N,
+                         (long long) n, (long long) K);
+            std::exit(1);
+        }
+        const dim3 grid((unsigned) std::min<int64_t>((N + 255) / 256, 64), (unsigned) n);
+        hh_f16_to_f32<<<grid, 256, 0, s>>>((const __half*) hh_out_, Y + t0 * ldy, N, ldy, beta);
+    }
+    return true;
+#else
+    (void) X; (void) W; (void) Y; (void) T; (void) N; (void) K; (void) ldy; (void) beta;
+    return false;
+#endif
 }
 
 void Gemm::native(const uint16_t* X, int ggml_type, const void* W_blocks, float* Y, int64_t T, int64_t N, int64_t K,

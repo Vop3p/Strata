@@ -80,7 +80,7 @@ __device__ __forceinline__ void load8(const QsaAttnPools& p, bool value, long lo
     } else load8_q4(p, value, row, d0, out);
 }
 
-template <int KV_MODE>
+template <int KV_MODE, bool S4 = false>
 __global__ void __launch_bounds__(THREADS) attn_chunk_kernel(const float* __restrict__ q, QsaAttnPools p,
                                                              const int32_t* __restrict__ ids,
                                                              const int32_t* __restrict__ step, int n_kv_heads,
@@ -120,6 +120,42 @@ __global__ void __launch_bounds__(THREADS) attn_chunk_kernel(const float* __rest
         srow[t] = r;
     }
     __syncthreads();
+    if constexpr (KV_MODE == 1 && S4) {
+    // S4 (INT8 K): four threads per cell, each 64 of the 256 dimensions as 16 groups of 4 (d = 16 i + 4 qd + j), so
+    // a cell needs two shuffles per head instead of a 32-lane reduction (RDNA2: the shuffles dominated), and the four
+    // threads of a cell read neighbouring float4s of sq (no LDS bank conflict; other cells broadcast).
+    {
+        const int c = t >> 2, qd = t & 3;
+        const bool ok = c < n_here && srow[c] >= 0;
+        float sc_[G];
+#pragma unroll
+        for (int h = 0; h < G; ++h) sc_[h] = 0.0f;
+        if (ok) {
+            const int8_t* codes = p.k_q + srow[c] * HD;
+            const uint16_t* scl = p.k_scale + srow[c] * (HD / KV_Q8_GROUP);
+#pragma unroll 4
+            for (int i = 0; i < 16; ++i) {
+                const int d = 16 * i + 4 * qd;
+                const int raw = *reinterpret_cast<const int*>(codes + d);
+                const float g = __half2float(__ushort_as_half(scl[d / KV_Q8_GROUP]));
+                const float k0 = (float) (int8_t) (raw & 0xff) * g, k1 = (float) (int8_t) ((raw >> 8) & 0xff) * g;
+                const float k2 = (float) (int8_t) ((raw >> 16) & 0xff) * g, k3 = (float) (int8_t) (raw >> 24) * g;
+#pragma unroll
+                for (int h = 0; h < G; ++h) {
+                    const float4 qv = *reinterpret_cast<const float4*>(&sq[h][d]);
+                    sc_[h] = fmaf(k0, qv.x, fmaf(k1, qv.y, fmaf(k2, qv.z, fmaf(k3, qv.w, sc_[h]))));
+                }
+            }
+        }
+#pragma unroll
+        for (int h = 0; h < G; ++h) {
+            float v = sc_[h];
+            v += __shfl_xor_sync(0xffffffffu, v, 1);
+            v += __shfl_xor_sync(0xffffffffu, v, 2);
+            if (qd == 0) sp[h][c] = ok ? v * scale : -FLT_MAX;
+        }
+    }
+    } else
     // scores: each warp takes cells warp, warp+8, ...; each lane holds 8 of the 256 dimensions.
     for (int c = warp; c < CHUNK; c += WARPS) {
         if (c >= n_here || srow[c] < 0) {
@@ -206,6 +242,11 @@ __global__ void __launch_bounds__(HD) attn_merge_kernel(const float* __restrict_
     attn[(size_t) h * HD + d] = L > 0.0f ? acc / L : 0.0f;
 }
 
+bool qsa_s4() {
+    static const bool on = [] { const char* e = std::getenv("STRATA_QSA_S4"); return e && e[0] == '1'; }();
+    return on;
+}
+
 }  // namespace
 
 void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,
@@ -232,6 +273,9 @@ void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int3
                                                         scale, part_acc, part_m, part_l, n_chunks, (int) cap, stride);
     else if (kv_mode == 2)
         attn_chunk_kernel<2><<<grid, THREADS, 0, st>>>(q, pools, ids, steps, (int) s.n_head_kv, (int) s.page_size,
+                                                        scale, part_acc, part_m, part_l, n_chunks, (int) cap, stride);
+    else if (kv_mode == 1 && qsa_s4())
+        attn_chunk_kernel<1, true><<<grid, THREADS, 0, st>>>(q, pools, ids, steps, (int) s.n_head_kv, (int) s.page_size,
                                                         scale, part_acc, part_m, part_l, n_chunks, (int) cap, stride);
     else if (kv_mode == 1)
         attn_chunk_kernel<1><<<grid, THREADS, 0, st>>>(q, pools, ids, steps, (int) s.n_head_kv, (int) s.page_size,
@@ -280,6 +324,9 @@ void qsa_decode_attn_step(const float* q, const QsaAttnPools& pools, const int32
                                                         scale, part_acc, part_m, part_l, n_chunks);
     else if (kv_mode == 2)
         attn_chunk_kernel<2><<<grid, THREADS, 0, st>>>(q, pools, ids, step, (int) s.n_head_kv, (int) s.page_size,
+                                                        scale, part_acc, part_m, part_l, n_chunks);
+    else if (kv_mode == 1 && qsa_s4())
+        attn_chunk_kernel<1, true><<<grid, THREADS, 0, st>>>(q, pools, ids, step, (int) s.n_head_kv, (int) s.page_size,
                                                         scale, part_acc, part_m, part_l, n_chunks);
     else if (kv_mode == 1)
         attn_chunk_kernel<1><<<grid, THREADS, 0, st>>>(q, pools, ids, step, (int) s.n_head_kv, (int) s.page_size,

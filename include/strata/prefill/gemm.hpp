@@ -52,6 +52,15 @@ private:
     void* workspace_ = nullptr;
     bool external_ = false;
     void* hipblaslt_state_ = nullptr;
+    // HIP (gfx1030): rocBLAS has tuned kernels only for FP16 in -> FP16 out (HH_HPA); FP16->FP32 and every BF16
+    // combination fall back to a generic 64x32x8 tile (~5.5 vs ~37 TFLOPS on an RX 6900 XT).  These buffers hold
+    // the FP16 product and the BF16->FP16 conversions (STRATA_HIP_HHGEMM=0 turns the path off).
+    uint16_t* hh_out_ = nullptr;
+    uint16_t* hh_x_ = nullptr;
+    uint16_t* hh_w_ = nullptr;
+    int64_t hh_out_cap_ = 0, hh_x_cap_ = 0, hh_w_cap_ = 0;
+    bool hh_grow(uint16_t*& p, int64_t& cap, int64_t need);
+    bool hh(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy, float beta);
 };
 
 

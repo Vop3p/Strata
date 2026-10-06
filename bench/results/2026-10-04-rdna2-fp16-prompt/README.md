@@ -130,6 +130,10 @@ would need `STRATA_HIP_PROMPT_F16=0`.
   row from its end; `Gemm::bf16` converts W row slices to FP16 through the existing dequantization scratch (as
   `native()` does) and takes X as the FP16 image. `bf16x2_mode()` is 0 there (the BF16 low part has no FP16 meaning).
 - No new device memory, no host sync, no fallback branch; CUDA builds are unchanged (`#if defined(__HIPCC__)`).
+- `hip_prefill_gemm` (ctest) runs its shapes a second time with `set_f16_io(true)` on any HIP card: X as the FP16 image
+  for the BF16 products, a scratch of 64 rows so a 96-row weight converts in two slices, `ldy > N`, an odd N, T = 1 and
+  a `beta = 1` f16() call (which keeps the FP32-out GEMM). The FP16-out results are checked against the double reference
+  at FP16's rounding (6e-4 relative per element, rel L2 < 1e-3); row padding and the guards around Y must be untouched.
 
 ## Limits
 

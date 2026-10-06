@@ -210,6 +210,15 @@ struct Alloc {
 // left the GPU without queued work while each ~2 MB memcpy ran (~15 s of a 32K prompt on IQ3_S).  Job j - a layer's
 // j-th unpinned expert, in launch order - lands in host buffer j % kRing, which is free again once the DMA of job
 // j - kRing (recorded by the launching thread, `issued`) is done.
+// What the stall watchdog prints about a prompt chunk's host threads (the issuer, the stager's workers).
+struct PrefillDiag {
+    std::atomic<int64_t> seq{-1}, ring{0}, issued{0}, consumed{0}, issuer_idx{-1};
+    std::atomic<int> issuer_state{0};   // 0 none, 1 waiting for a slot (give_back), 2 waiting for a stager job, 3 in a CUDA call, 4 done
+    std::atomic<int> w_issued{0}, w_event{0}, w_copy{0};   // stager workers waiting for `issued`, in cudaEventSynchronize, copying
+    std::atomic<const void*> stager{nullptr};
+};
+PrefillDiag& pdiag() { static PrefillDiag d; return d; }
+
 struct Stager {
     // D-5: the pinned ring's depth (STRATA_STAGER_RING, default 16) - how far the host copies can run ahead of the
     // DMAs of the unpinned experts' blobs
@@ -279,18 +288,25 @@ struct Stager {
                 const int j = claim(seen);
                 if (j < 0) { active.fetch_sub(1, std::memory_order_acq_rel); break; }
                 const int b = j % kRing;
-                if (j >= kRing)   // job j - kRing's DMA from this buffer is queued
+                if (j >= kRing) {   // job j - kRing's DMA from this buffer is queued
+                    pdiag().w_issued.fetch_add(1);
                     while (issued.load(std::memory_order_acquire) <= j - kRing) std::this_thread::yield();
+                    pdiag().w_issued.fetch_sub(1);
+                }
                 // and done - for a generation's first kRing jobs that is the previous generation's last DMA from
                 // the buffer, which nothing else waits for when a chunk ends without a sync (no MTP) or the DMA
                 // was a ring entry the routing skipped (an event never recorded returns at once)
+                pdiag().w_event.fetch_add(1);
                 cudaEventSynchronize(dma_done[b]);
+                pdiag().w_event.fetch_sub(1);
+                pdiag().w_copy.fetch_add(1);
                 const Job& jb = jobs[(size_t) j];
                 if (jb.from == nullptr) std::memcpy(buf[b], jb.src, jb.bytes);
                 else if (!jb.from->copy_blob(jb.l, jb.e, buf[b])) {
                     std::fprintf(stderr, "prefill: the expert source could not copy expert %d of layer %d\n", jb.e, jb.l);
                     std::abort();
                 }
+                pdiag().w_copy.fetch_sub(1);
                 ready[(size_t) j].store(1, std::memory_order_release);
                 active.fetch_sub(1, std::memory_order_acq_rel);
             }
@@ -337,6 +353,20 @@ struct Stager {
         while (active.load(std::memory_order_acquire) != 0) std::this_thread::yield();
     }
 };
+
+void diag_prefill(std::FILE* f) {
+    const PrefillDiag& d = pdiag();
+    static const char* st[] = {"none", "waiting for a ring slot (give_back)", "waiting for a stager job", "in a CUDA call", "done"};
+    const int is = d.issuer_state.load();
+    std::fprintf(f, "  prompt issuer: %lld entries, ring %lld; issued %lld, given back %lld; issuer at entry %lld, %s\n",
+                 (long long) d.seq.load(), (long long) d.ring.load(), (long long) d.issued.load(), (long long) d.consumed.load(),
+                 (long long) d.issuer_idx.load(), is >= 0 && is <= 4 ? st[is] : "?");
+    if (const Stager* sg = (const Stager*) d.stager.load())
+        std::fprintf(f, "  prompt stager: gen %u, head n=%llu next=%llu, issued %d, active %d; workers waiting for issued %d, "
+                        "in cudaEventSynchronize %d, copying %d\n",
+                     sg->gen, (unsigned long long) ((sg->head.load() >> 16) & 0xffff), (unsigned long long) (sg->head.load() & 0xffff),
+                     sg->issued.load(), sg->active.load(), d.w_issued.load(), d.w_event.load(), d.w_copy.load());
+}
 
 // multi-GPU: the peer GPU's share of a prompt chunk's experts.  Per MoE layer the primary copies its normed
 // activations over P2P, the peer quantizes the rows routed to the experts it holds, runs the same MMQ products the
@@ -1436,6 +1466,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
             if (!ple_pending) return true;
             ple_pending = false;
             const auto tp = Clock::now();
+            core::progress_at("reading the prompt (batched): waiting for the PLE rows' gather (SSD thread)", -1, p0);
             if (!ple_next.get()) {
                 err = ple_next_err;
                 return false;
@@ -1448,6 +1479,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
             }
             if (c0 + m.T < n) {
                 // the other buffer's upload (a chunk ago) is done before the SSD thread refills it
+                core::progress_at("reading the prompt (batched): waiting for the previous PLE upload event", -1, p0);
                 if (cudaEventSynchronize(m.ple_copied[ple_buf ^ 1]) != cudaSuccess) {
                     err = std::string("prefill: the PLE rows' upload failed: ") + cudaGetErrorString(cudaGetLastError());
                     return false;
@@ -1595,14 +1627,22 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
             ~IssuerJoin() { if (t->joinable()) { stop->store(true); t->join(); } }
         } issuer_join{&a_stop, &issuer};
         const bool threaded_issue = stream_all && issuer_on;
+        pdiag().seq.store(threaded_issue ? (int64_t) seq.size() : -1);
+        pdiag().ring.store((int64_t) m.ring);
+        pdiag().issued.store(0); pdiag().consumed.store(0); pdiag().issuer_idx.store(-1); pdiag().issuer_state.store(threaded_issue ? 3 : 0);
+        pdiag().stager.store(m.stager.get());
+        core::diag_prefill_fn().store(&diag_prefill);
         if (threaded_issue) {
             issuer = std::thread([&] {
                 const core::OnDevice od(m.device);
                 for (size_t idx = 0; idx < seq.size(); ++idx) {
+                    pdiag().issuer_idx.store((int64_t) idx);
+                    pdiag().issuer_state.store(1);
                     while (idx >= a_consumed.load(std::memory_order_acquire) + (size_t) m.ring) {
-                        if (a_stop.load(std::memory_order_acquire)) return;
+                        if (a_stop.load(std::memory_order_acquire)) { pdiag().issuer_state.store(0); return; }
                         std::this_thread::yield();
                     }
+                    pdiag().issuer_state.store(3);
                     const StreamEntry& en = seq[idx];
                     const int sl = (int) (idx % (size_t) m.ring);
                     const auto th = Clock::now();
@@ -1612,7 +1652,9 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                         cudaMemcpyAsync(m.stage_dev[sl], en.blob, bytes, cudaMemcpyHostToDevice, m.copy);
                         ++iss_dma;
                     } else {
+                        pdiag().issuer_state.store(2);
                         const uint8_t* hb = m.stager->wait(en.job);
+                        pdiag().issuer_state.store(3);
                         cudaMemcpyAsync(m.stage_dev[sl], hb, bytes, cudaMemcpyHostToDevice, m.copy);
                         m.stager->issued_one(en.job, m.copy);
                     }
@@ -1621,7 +1663,9 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     iss_ms += ms_since(th);
                     ++iss_streamed;
                     a_issued.store(idx + 1, std::memory_order_release);
+                    pdiag().issued.store((int64_t) idx + 1);
                 }
+                pdiag().issuer_state.store(4);
             });
         } else if (stream_all) {
             issue_until((size_t) m.ring);   // layer 0's first experts, behind the embedding and the PLE
@@ -1629,10 +1673,13 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
         // the consumer's side: entry k's copy is on the copy stream (the thread issued it), then k is given back
         auto wait_issued = [&](size_t k) {
             if (!threaded_issue) return;
+            if (a_issued.load(std::memory_order_acquire) > k) return;
+            core::progress_at("reading the prompt (batched): waiting for the copy-issuer thread, entry", (int64_t) k, p0);
             while (a_issued.load(std::memory_order_acquire) <= k) std::this_thread::yield();
+            core::progress_at("reading the prompt (batched): past the copy-issuer wait, entry", (int64_t) k, p0);
         };
         auto give_back = [&](size_t upto) {
-            if (threaded_issue) a_consumed.store(upto, std::memory_order_release);
+            if (threaded_issue) { a_consumed.store(upto, std::memory_order_release); pdiag().consumed.store((int64_t) upto); }
             else issue_until(upto + (size_t) m.ring);
         };
         if (ps_on) {
@@ -1648,7 +1695,10 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
             core::progress_beat();   // the serve watchdog: a prompt chunk of 8192 tokens is still moving
             core::progress_at("reading the prompt (batched): layer", l, p0);   // #251: a stall names layer and chunk
             const core::LayerView v(*m.wt, l);
-            if (l == std::max<int64_t>(LB, 1) && !ple_land()) return false;   // the PLE rows, read from layer 1 on
+            if (l == std::max<int64_t>(LB, 1)) {
+                if (!ple_land()) return false;   // the PLE rows, read from layer 1 on
+                core::progress_at("reading the prompt (batched): PLE rows landed, layer", l, p0);
+            }
             // ---- the PLE block at layer 1, token by token (its conv reads the previous tokens' rows)
             if (l == 1 && ple_on && ple_batch) {
                 // the whole chunk at once, in sub-batches carved from the idle scratch region: the key and value
@@ -2051,11 +2101,14 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                         int32_t* src_h = grp_mapped ? m.grp_host + 2 * m.grp_tk : m.src_host.data();
                         if (grp_mapped) copy_i32(m.grp_dev, m.ids, T * K, m.cs);
                         else cudaMemcpyAsync(m.ids_host.data(), m.ids, (size_t) T * K * 4, cudaMemcpyDeviceToHost, m.cs);
+                        core::progress_at("reading the prompt (batched): waiting for the GPU's routing ids, layer", l, p0);
                         cudaStreamSynchronize(m.cs);
                         pt.fold();
                         if (pe.on) {   // the peer's marks so far are done: the primary waited for its last rows
+                            core::progress_at("reading the prompt (batched): waiting for the peer GPU's stream, layer", l, p0);
                             int pd = 0; cudaGetDevice(&pd); cudaSetDevice(pe.dev); cudaStreamSynchronize(m.pp->s); pe.fold(); cudaSetDevice(pd);
                         }
+                        core::progress_at("reading the prompt (batched): routing ids back, layer", l, p0);
                         std::fill(m.cnt.begin(), m.cnt.end(), 0);
                         for (int64_t i = 0; i < T * K; ++i) {
                             const int32_t e = ids_h[(size_t) i];
